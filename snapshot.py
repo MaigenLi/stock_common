@@ -30,7 +30,7 @@ from .complete_kline import (
 
 LOCAL_STOCK_NAMES_FILE = os.path.expanduser("~/stock_code/results/all_stock_names_final.json")
 WORKSPACE_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-STAGE_TREND_SECTOR_FILE = os.path.join(WORKSPACE_ROOT, 'stock_stage_trend', 'stock_sector.py')
+STAGE_TREND_SECTOR_FILE = os.path.join(WORKSPACE_ROOT, 'stock_trend', 'core', 'stock_sector.py')
 
 
 @dataclass
@@ -103,6 +103,34 @@ def _get_sector_fetcher():
         return module.get_sector_info()
     except Exception:
         return None
+
+
+def get_stock_sector_info(code: str, allow_online: bool = True) -> Dict:
+    """
+    获取单只股票的板块信息及板块热点。
+
+    参数：
+        code        股票代码（如 sh600036、600036、sz000858）
+        allow_online  是否允许联网获取（默认 True）
+
+    返回字典：
+        code              标准化代码
+        name              股票名称
+        sectors           所属板块列表
+        main_sector       主板块名称
+        sector_category   板块分类（科技/新能源/医药/…）
+        sector_hotness    板块热度 0~100
+        sector_popularity 板块人气 0~100
+        source            数据来源
+
+    示例：
+        >>> info = get_stock_sector_info('sh600036')
+        >>> print(info['main_sector'], info['sector_hotness'])
+    """
+    normalized = normalize_stock_code(code)
+    name = get_local_stock_name(normalized)
+    snap = get_sector_snapshot(normalized, name=name, allow_online=allow_online)
+    return snap
 
 
 def get_sector_snapshot(code: str, name: str = '', allow_online: bool = True) -> Dict:

@@ -297,6 +297,85 @@ def screen_trend_volume(codes: list, shares_cache: dict) -> list:
     return candidates[:50]
 
 
+# ── 板块热点 ─────────────────────────────────────────────
+
+def get_market_sector_hotspots(top_n: int = 15) -> dict:
+    """
+    获取市场板块热点数据（东方财富 API）。
+    返回 dict:
+      - rise: 涨幅前N板块 [{name, change_pct}]
+      - fall: 跌幅前N板块
+      - amount: 成交额前N板块 [{name, change_pct, amount}]
+    """
+    import requests
+    import warnings
+    warnings.filterwarnings('ignore')
+
+    result = {"rise": [], "fall": [], "amount": []}
+
+    try:
+        url = "https://push2.eastmoney.com/api/qt/clist/get"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Referer": "https://quote.eastmoney.com/",
+        }
+
+        # 涨幅榜
+        rise_params = {
+            "cb": "jQuery",
+            "pn": 1,
+            "pz": 200,          # 多取一些，确保包含跌幅榜
+            "po": 1,
+            "np": 1,
+            "fltt": 2,
+            "invt": 2,
+            "fid": "f3",
+            "fs": "m:90 t:2 f:!50",
+            "fields": "f3,f6,f8,f12,f14",
+            "_": int(time.time() * 1000),
+        }
+        resp = requests.get(url, params=rise_params, headers=headers, timeout=8)
+        text = resp.text[resp.text.index("(") + 1 : resp.text.rindex(")")]
+        data = json.loads(text)
+        items = (data.get("data") or {}).get("diff") or []
+        result["rise"] = [
+            {"name": itm["f14"], "change_pct": round(float(itm["f3"] or 0), 2)}
+            for itm in items if itm.get("f14")
+        ][:top_n]
+
+        # 跌幅榜（按涨幅升序排列，取前top_n个负值板块）
+        fall_items = sorted(
+            [itm for itm in items if itm.get("f14")],
+            key=lambda x: float(x.get("f3") or 0)
+        )
+        result["fall"] = [
+            {"name": itm["f14"], "change_pct": round(float(itm["f3"] or 0), 2)}
+            for itm in fall_items if float(itm.get("f3") or 0) < 0
+        ][:top_n]
+
+        # 成交额榜
+        amt_params = dict(rise_params)
+        amt_params["fid"] = "f6"   # f6=成交额（元）
+        amt_params["pz"] = 100     # 取成交额前100
+        amt_resp = requests.get(url, params=amt_params, headers=headers, timeout=8)
+        amt_text = amt_resp.text[amt_resp.text.index("(") + 1 : amt_resp.text.rindex(")")]
+        amt_data = json.loads(amt_text)
+        amt_items = (amt_data.get("data") or {}).get("diff") or []
+        result["amount"] = [
+            {
+                "name": itm["f14"],
+                "change_pct": round(float(itm["f3"] or 0), 2),
+                "amount": float(itm.get("f6") or 0),
+            }
+            for itm in amt_items if itm.get("f14") and float(itm.get("f6") or 0) > 0
+        ][:top_n]
+
+    except Exception as e:
+        print(f"  ⚠️  板块热点获取失败: {e}")
+
+    return result
+
+
 # ── 涨停股 ────────────────────────────────────────────────
 
 def get_limit_up_stocks(movers: dict) -> list:
@@ -328,7 +407,8 @@ def format_volume(vol: float) -> str:
 
 
 def generate_html_report(date_str: str, index_data: list, movers: dict,
-                         limit_up: list, trend_stocks: list) -> str:
+                         limit_up: list, trend_stocks: list,
+                         sector_hotspots: dict = None) -> str:
     """生成 HTML 格式复盘报告"""
 
     # 涨跌统计
@@ -411,9 +491,64 @@ def generate_html_report(date_str: str, index_data: list, movers: dict,
     <div class="label">统计股票</div></div>
 </div>"""
 
-    # 涨停股
+    # 板块热点
+    top_n_sectors = 10
+    if sector_hotspots:
+        # 涨幅榜
+        rise_sectors = sector_hotspots.get("rise", [])
+        # 跌幅榜
+        fall_sectors = sector_hotspots.get("fall", [])
+        # 成交额榜
+        amount_sectors = sector_hotspots.get("amount", [])
+
+        html += """
+<h2>三、市场板块热点 <span class="tag">实时数据</span></h2>"""
+
+        # 涨幅榜
+        if rise_sectors:
+            html += f"""
+<h3>🔥 涨幅榜（前 {len(rise_sectors)} 板块）</h3>
+<div style="display:flex; flex-wrap:wrap; gap:8px; margin:10px 0;">"""
+            for s in rise_sectors[:top_n_sectors]:
+                color = "#e53935" if s["change_pct"] >= 5 else "#ff7043" if s["change_pct"] >= 3 else "#ef5350"
+                html += f"""<div style="background:#fff0f0; border-left:3px solid {color}; border-radius:4px;
+                             padding:6px 12px; min-width:120px;">
+  <div style="font-weight:bold; color:#333;">{s['name']}</div>
+  <div style="color:{color}; font-size:15px;">▲ {s['change_pct']:+.2f}%</div>
+</div>"""
+            html += "</div>"
+
+        # 跌幅榜
+        if fall_sectors:
+            html += f"""
+<h3>❄️ 跌幅榜（前 {len(fall_sectors)} 板块）</h3>
+<div style="display:flex; flex-wrap:wrap; gap:8px; margin:10px 0;">"""
+            for s in fall_sectors[:top_n_sectors]:
+                color = "#43a047" if s["change_pct"] <= -3 else "#66bb6a" if s["change_pct"] <= -1 else "#81c784"
+                html += f"""<div style="background:#f0f8f0; border-left:3px solid {color}; border-radius:4px;
+                             padding:6px 12px; min-width:120px;">
+  <div style="font-weight:bold; color:#333;">{s['name']}</div>
+  <div style="color:{color}; font-size:15px;">▼ {s['change_pct']:+.2f}%</div>
+</div>"""
+            html += "</div>"
+
+        # 成交额榜
+        if amount_sectors:
+            html += f"""
+<h3>💰 成交额榜（主力板块）</h3>
+<table><tr><th>板块名称</th><th>涨跌幅</th><th>成交额</th></tr>"""
+            for s in amount_sectors:
+                pct = s["change_pct"]
+                color = "#e53935" if pct > 0 else "#43a047" if pct < 0 else "#888"
+                arrow = "▲" if pct > 0 else "▼" if pct < 0 else "─"
+                amt_str = format_amount(s.get("amount") or 0)
+                html += f"<tr><td style='text-align:left;font-weight:bold;'>{s['name']}</td>"
+                html += f"<td style='color:{color}'>{arrow} {pct:+.2f}%</td>"
+                html += f"<td>{amt_str}</td></tr>"
+            html += "</table>"
+
     html += f"""
-<h2>三、涨停股 <span class="tag">共 {len(limit_up)} 只</span></h2>"""
+<h2>四、涨停股 <span class="tag">共 {len(limit_up)} 只</span></h2>"""
     if limit_up:
         html += "<table><tr><th>代码</th><th>名称</th><th>收盘价</th><th>涨幅</th><th>换手率</th></tr>"
         for s in limit_up[:30]:
@@ -428,7 +563,7 @@ def generate_html_report(date_str: str, index_data: list, movers: dict,
 
     # 成交额TOP20
     html += f"""
-<h2>四、成交额TOP20 <span class="tag">单位：元</span></h2>
+<h2>五、成交额TOP20 <span class="tag">单位：元</span></h2>
 <table><tr><th>代码</th><th>名称</th><th>收盘价</th><th>涨跌幅</th><th>成交额</th><th>换手率</th></tr>"""
     for s in by_amount:
         code = None
@@ -449,7 +584,7 @@ def generate_html_report(date_str: str, index_data: list, movers: dict,
 
     # 趋势放量候选
     html += f"""
-<h2>五、趋势放量候选 <span class="tag">共 {len(trend_stocks)} 只</span></h2>"""
+<h2>六、趋势放量候选 <span class="tag">共 {len(trend_stocks)} 只</span></h2>"""
     if trend_stocks:
         html += "<table><tr><th>代码</th><th>名称</th><th>收盘价</th><th>涨幅</th><th>量比</th><th>换手率</th><th>状态</th></tr>"
         for s in trend_stocks[:30]:
@@ -520,6 +655,14 @@ def run_review(date_str: str = None):
     limit_up = get_limit_up_stocks(movers)
     print(f"  涨停 {len(limit_up)} 只")
 
+    # 5b. 板块热点
+    print("▶️  获取板块热点数据...")
+    t5 = time.time()
+    sector_hotspots = get_market_sector_hotspots(top_n=15)
+    print(f"  涨幅板块 {len(sector_hotspots.get('rise', []))} 个，"
+          f"跌幅板块 {len(sector_hotspots.get('fall', []))} 个，"
+          f"成交额板块 {len(sector_hotspots.get('amount', []))} 个 ({time.time()-t5:.1f}s)")
+
     # 6. 趋势放量
     print("▶️  趋势放量筛选...")
     t4 = time.time()
@@ -528,7 +671,7 @@ def run_review(date_str: str = None):
 
     # 7. 生成报告
     print("▶️  生成报告...")
-    html = generate_html_report(date_str, index_data, movers, limit_up, trend_stocks)
+    html = generate_html_report(date_str, index_data, movers, limit_up, trend_stocks, sector_hotspots)
 
     # 8. 保存
     report_file = save_report(date_str, html)
