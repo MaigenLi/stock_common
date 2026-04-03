@@ -41,34 +41,82 @@ from stock_common.tdx_day_reader import (
 )
 
 # ============================================================
-#  实时换手率获取（腾讯财经API）
+#  本地股本缓存加载
 # ============================================================
 
-def _fetch_turnover_rate(code: str, timeout: float = 3.0) -> Optional[float]:
-    """
-    从腾讯财经实时API获取真实换手率。
+_SHARES_CACHE: Optional[dict] = None
 
-    换手率计算公式：
-        换手率(%) = 成交额(万元) / 流通市值(万元) × 100
-                   = field[37] / (field[44] × 10000) × 100
+
+def _load_shares_cache() -> dict:
+    """加载本地股本缓存（惰性加载，模块级缓存）"""
+    global _SHARES_CACHE
+    if _SHARES_CACHE is not None:
+        return _SHARES_CACHE
+    cache_path = Path.home() / ".stock_cache" / "shares" / "shares_cache.json"
+    if not cache_path.exists():
+        _SHARES_CACHE = {}
+        return _SHARES_CACHE
+    try:
+        import json
+        with open(cache_path, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        _SHARES_CACHE = obj.get("_data", obj)
+        return _SHARES_CACHE
+    except Exception:
+        _SHARES_CACHE = {}
+        return _SHARES_CACHE
+
+
+# ============================================================
+#  换手率计算（优先本地缓存，零网络开销）
+# ============================================================
+
+def _calc_turnover_from_cache(code: str, latest_record: dict) -> Optional[float]:
+    """
+    从本地缓存的股本数据计算换手率。
+
+    公式：换手率(%) = 成交量(手) × 收盘价 / (流通市值(亿元) × 10000)
+    推导：
+        流通股本(亿股) = 流通市值(亿元) / 收盘价
+        流通股本(手)  = 流通股本(亿股) × 1亿 / 100 = 流通市值(亿元) × 10^6 / 收盘价
+        换手率(%)     = 成交量(手) / 流通股本(手) × 100
+                      = 成交量(手) × 收盘价 × 100 / (流通市值(亿元) × 10^6)
 
     Parameters
     ----------
     code : str
-        股票代码（支持 sh/sz 前缀或纯数字）
-    timeout : float
-        请求超时（秒）
+        股票代码（sh/sz 前缀）
+    latest_record : dict
+        最新日K线记录，需含 volume（手）和 close
 
     Returns
     -------
     float or None
-        换手率（%），如今日无成交或API失败返回 None
+        换手率（%），缓存不存在返回 None
+    """
+    cache = _load_shares_cache()
+    info = cache.get(code) or cache.get(code.lower())
+    if not info:
+        return None
+    flow_cap = info.get("flow_market_cap")   # 流通市值（亿元）
+    volume = latest_record.get("volume")        # 成交量（手）
+    close = latest_record.get("close")         # 收盘价（元）
+    if not (flow_cap and flow_cap > 0 and volume and close and close > 0):
+        return None
+    turnover = volume * close * 100 / (flow_cap * 1e6)
+    return round(turnover, 2)
+
+
+def _fetch_turnover_rate_from_api(code: str, timeout: float = 3.0) -> Optional[float]:
+    """
+    从腾讯财经实时API获取换手率（仅作兜底）。
+    已内置本地缓存，计算换手率不依赖网络。
     """
     try:
         import requests
-        normalized = _normalize_code_for_api(code)
+        m, p = _normalize_code(code)
         resp = requests.get(
-            f"http://qt.gtimg.cn/q={normalized}",
+            f"http://qt.gtimg.cn/q={m}{p}",
             headers={"User-Agent": "Mozilla/5.0", "Referer": "http://finance.qq.com/"},
             timeout=timeout,
         )
@@ -77,27 +125,19 @@ def _fetch_turnover_rate(code: str, timeout: float = 3.0) -> Optional[float]:
         text = resp.text.strip()
         if '="' not in text:
             return None
-        payload = text.split('="', 1)[1].rstrip('";')
-        fields = payload.split('~')
+        fields = text.split('="', 1)[1].rstrip('";').split('~')
         if len(fields) < 45:
             return None
-        amount_wan = _safe_float(fields[37])      # 成交额（万元）
-        flow_cap = _safe_float(fields[44])        # 流通市值（亿元）
+        amount_wan = _safe_float(fields[37])
+        flow_cap = _safe_float(fields[44])
         if amount_wan is None or flow_cap is None or flow_cap <= 0:
             return None
-        turnover = amount_wan / (flow_cap * 1e4) * 100
-        return round(turnover, 2)
+        return round(amount_wan / (flow_cap * 1e4) * 100, 2)
     except Exception:
         return None
 
 
-def _normalize_code_for_api(code: str) -> str:
-    """标准化代码为腾讯API格式（sh600036）"""
-    m, p = _normalize_code(code)
-    return f"{m}{p}"
-
-
-def _safe_float(s: str, default=None):
+def _safe_float(s, default=None):
     try:
         return float(s)
     except (ValueError, TypeError):
@@ -319,10 +359,12 @@ def analyze_from_cache(
     recent_high = recent_no_today['high'].max()
     is_breakout = float(latest['close']) > float(recent_high)
 
-    # ---- 换手率（腾讯实时API，真实值）----
-    # 公式：成交额(万元) / 流通市值(万元) × 100
-    # = field[37] / (field[44] × 10000) × 100
-    turnover_rate = _fetch_turnover_rate(code)
+    # ---- 换手率（本地缓存，零网络开销）----
+    # 公式：成交量(手) × 收盘价 × 100 / (流通市值(亿元) × 10^6)
+    turnover_rate = _calc_turnover_from_cache(code, latest)
+    # 兜底：本地缓存也没有再走API
+    if turnover_rate is None:
+        turnover_rate = _fetch_turnover_rate_from_api(code)
 
     # ---- 综合 ----
     interval_change = float(
