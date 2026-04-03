@@ -41,6 +41,70 @@ from stock_common.tdx_day_reader import (
 )
 
 # ============================================================
+#  实时换手率获取（腾讯财经API）
+# ============================================================
+
+def _fetch_turnover_rate(code: str, timeout: float = 3.0) -> Optional[float]:
+    """
+    从腾讯财经实时API获取真实换手率。
+
+    换手率计算公式：
+        换手率(%) = 成交额(万元) / 流通市值(万元) × 100
+                   = field[37] / (field[44] × 10000) × 100
+
+    Parameters
+    ----------
+    code : str
+        股票代码（支持 sh/sz 前缀或纯数字）
+    timeout : float
+        请求超时（秒）
+
+    Returns
+    -------
+    float or None
+        换手率（%），如今日无成交或API失败返回 None
+    """
+    try:
+        import requests
+        normalized = _normalize_code_for_api(code)
+        resp = requests.get(
+            f"http://qt.gtimg.cn/q={normalized}",
+            headers={"User-Agent": "Mozilla/5.0", "Referer": "http://finance.qq.com/"},
+            timeout=timeout,
+        )
+        if resp.status_code != 200:
+            return None
+        text = resp.text.strip()
+        if '="' not in text:
+            return None
+        payload = text.split('="', 1)[1].rstrip('";')
+        fields = payload.split('~')
+        if len(fields) < 45:
+            return None
+        amount_wan = _safe_float(fields[37])      # 成交额（万元）
+        flow_cap = _safe_float(fields[44])        # 流通市值（亿元）
+        if amount_wan is None or flow_cap is None or flow_cap <= 0:
+            return None
+        turnover = amount_wan / (flow_cap * 1e4) * 100
+        return round(turnover, 2)
+    except Exception:
+        return None
+
+
+def _normalize_code_for_api(code: str) -> str:
+    """标准化代码为腾讯API格式（sh600036）"""
+    m, p = _normalize_code(code)
+    return f"{m}{p}"
+
+
+def _safe_float(s: str, default=None):
+    try:
+        return float(s)
+    except (ValueError, TypeError):
+        return default
+
+
+# ============================================================
 #  预加载：一次性读取全部股票数据到内存
 # ============================================================
 
@@ -255,24 +319,10 @@ def analyze_from_cache(
     recent_high = recent_no_today['high'].max()
     is_breakout = float(latest['close']) > float(recent_high)
 
-    # ---- 换手率 ----
-    # 估算换手率 = 成交额/市值 = volume*100*close / (close*总股本) = volume*100/总股本
-    # 通达信 .day 没有总股本数据，用"假设流通股本=成交量×收盘价/昨日收盘"做近似
-    # 更实用做法：用成交额/昨日收盘市值近似，换手率(%) = 成交额/(收盘价×总股本) × 100
-    # 由于无总股本数据，采用近似：换手率 ≈ 成交量(手) / 假设流通盘(万股) × 100
-    # 默认流盘≈3000万股为典型值，计算后除以100得到百分比
-    # 更准的近似：成交额/收盘价/1亿 = 成交量(手)×收盘价/收盘价/1亿 = 成交量(手)/100万
-    # 换手率(%) ≈ 成交量(手) / 100000，即1万手≈10%
-    # 这个换算对不同价格股票有差异，提供原始值供判断
-    turnover_rate = None
-    if latest['close'] > 0 and latest['volume'] > 0:
-        # 近似换手率：成交额/（收盘价×假设总股本1亿股）×100%
-        # = (成交量×收盘价) / (收盘价 × 1亿) × 100%
-        # = 成交量(手) / 1万手 ≈ 成交量/10000
-        # 但实际流通盘差异很大，这里给出的是"参考换手率（假设全流通）"
-        total_shares_estimate = 1_0000_0000  # 假设1亿股
-        turnover_rate = float(latest['volume'] * 100) / total_shares_estimate * 100  # %
-        turnover_rate = round(turnover_rate, 2)
+    # ---- 换手率（腾讯实时API，真实值）----
+    # 公式：成交额(万元) / 流通市值(万元) × 100
+    # = field[37] / (field[44] × 10000) × 100
+    turnover_rate = _fetch_turnover_rate(code)
 
     # ---- 综合 ----
     interval_change = float(
