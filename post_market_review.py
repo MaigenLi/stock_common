@@ -14,7 +14,7 @@
   ~/.stock_cache/{sh,sz}/（numpy 缓存）
 
 邮件配置（环境变量）：
-  QQ_EMAIL=920662304@qq.com
+  QQ_EMAIL=maigenmuzi@qq.com
   QQ_PASS=xxx（QQ邮箱授权码）
 """
 
@@ -30,12 +30,29 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.header import Header
 from pathlib import Path
 from threading import Lock
 
 # ── 邮件配置 ──────────────────────────────────────────────
-QQ_EMAIL = os.getenv("QQ_EMAIL", "920662304@qq.com")
-QQ_PASS = os.getenv("QQ_PASS", "")
+# 优先读取环境变量，未设置则从 .env 文件加载
+_QQ_EMAIL = os.getenv("QQ_EMAIL")
+_QQ_PASS = os.getenv("QQ_PASS")
+if not _QQ_EMAIL or not _QQ_PASS:
+    _env_file = Path.home() / ".openclaw" / ".env"
+    if _env_file.exists():
+        for line in _env_file.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("#") or not line:
+                continue
+            if "=" in line:
+                k, v = line.split("=", 1)
+                if k == "QQ_EMAIL":
+                    _QQ_EMAIL = v.strip()
+                elif k == "QQ_PASS":
+                    _QQ_PASS = v.strip()
+QQ_EMAIL = _QQ_EMAIL or "920662304@qq.com"
+QQ_PASS = _QQ_PASS or ""
 SMTP_HOST = "smtp.qq.com"
 SMTP_PORT = 587
 
@@ -83,8 +100,8 @@ def send_email(subject: str, html_body: str, to_email: str = None) -> bool:
         return False
 
     msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"] = f"量化助手 <{QQ_EMAIL}>"
+    msg["Subject"] = Header(subject, "utf-8").encode()
+    msg["From"] = QQ_EMAIL
     msg["To"] = to_email
     msg.attach(MIMEText(html_body, "html", "utf-8"))
 
