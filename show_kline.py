@@ -28,10 +28,19 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-# stock_common 目录本身即 Python 包路径（已在上层目录）
+# stock_common 目录本身即 Python 包路径
+# 检测运行上下文：从 stock_common 目录内运行 vs 从 workspace 运行
+_SCRIPT_DIR = Path(__file__).parent.resolve()
+_IN_STOCK_COMMON_DIR = _SCRIPT_DIR.name == 'stock_common'
 
-from stock_common.tdx_day_reader import print_kline, read_tdx_kline
-from stock_common.trend_volume import preload_all_klines, analyze_from_cache
+if _IN_STOCK_COMMON_DIR:
+    # 从 stock_common 目录内运行（如 cd stock_common && python show_kline.py）
+    from tdx_day_reader import print_kline, read_tdx_kline
+    from trend_volume import preload_all_klines, analyze_from_cache
+else:
+    # 从 workspace 根目录运行（如 python stock_common/show_kline.py）
+    from stock_common.tdx_day_reader import print_kline, read_tdx_kline
+    from stock_common.trend_volume import preload_all_klines, analyze_from_cache
 
 DEFAULT_CODE_FILE = '/home/hfie/stock_code/results/stock_codes.txt'
 
@@ -276,7 +285,10 @@ def rank_stocks(date: str, gain_threshold: float, top_n: int,
 
 def _read_last_n_records(code: str, n: int) -> list:
     """只读取文件最后 n 条记录，极轻量"""
-    from stock_common.tdx_day_reader import _normalize_code, _find_file, _parse_record, RECORD_SIZE
+    if _IN_STOCK_COMMON_DIR:
+        from tdx_day_reader import _normalize_code, _find_file, _parse_record, RECORD_SIZE
+    else:
+        from stock_common.tdx_day_reader import _normalize_code, _find_file, _parse_record, RECORD_SIZE
     market, pure = _normalize_code(code)
     fp = _find_file(code)
     with open(fp, 'rb') as f:
