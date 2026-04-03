@@ -388,7 +388,8 @@ def main():
     if args.show:
         cache = load_cache()
         meta = cache.get("_meta", {})
-        print(f"缓存股票数: {len(cache) - 1}")  # 减去 _meta
+        data = cache.get("_data", {})
+        print(f"缓存股票数: {len(data)}")
         if "_meta" in cache:
             print(f"最后更新: {meta.get('updated_at', '未知')}")
         return
