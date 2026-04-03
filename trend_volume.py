@@ -1,0 +1,425 @@
+"""
+K线形态趋势量能分析通用接口
+============================
+判断股票是否处于"上升趋势 + 阶段放量"形态
+
+使用说明:
+  from stock_common.trend_volume import is_trend_volume, is_trend_volume_batch
+
+  # 单码
+  result = is_trend_volume("sh600036")
+
+  # 批量（一次性读完全部股票，极速）
+  results = is_trend_volume_batch(codes_list)
+
+  # 极速版：从预加载的 dict 直接分析（零磁盘IO）
+  data_map = preload_all_klines(codes_list)  # 一次性读完全部
+  result = analyze_from_cache(code, data_map)  # 纯内存计算
+
+接口说明:
+  is_trend_volume()       - 单码分析（独立使用，自己读文件）
+  is_trend_volume_batch() - 批量分析（30线程并发读文件）
+  preload_all_klines()    - 一次性预加载全部股票K线（零重复IO）
+  analyze_from_cache()    - 从预加载数据中分析（供 rank_stocks 复用）
+"""
+
+import sys
+import time
+import struct
+from pathlib import Path
+from typing import Optional, Dict, List
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from stock_common.tdx_day_reader import TDX_DATA_DIR, RECORD_SIZE, _normalize_code, _find_file, _parse_record
+
+# ============================================================
+#  预加载：一次性读取全部股票数据到内存
+# ============================================================
+
+def preload_all_klines(
+    codes: List[str],
+    days: int = 80,
+    workers: int = 30,
+    progress: bool = True,
+) -> Dict[str, list]:
+    """
+    一次性加载全部股票的K线数据到内存。
+
+    比逐个调用 read_tdx_kline 快 N 倍，因为：
+    1. 避免同一文件被多次读取（Phase 1 + Phase 2）
+    2. 多线程并发预读
+
+    Parameters
+    ----------
+    codes : list
+        股票代码列表
+    days : int
+        加载最近多少天（默认80，够算MA60）
+    workers : int
+        并发数（默认30）
+
+    Returns
+    -------
+    dict
+        {code: [ {date, open, high, low, close, volume, amount}, ... ]}
+        按 date 升序排列
+    """
+    codes = [c.strip() for c in codes if c.strip()]
+    total = len(codes)
+    result_map: Dict[str, list] = {}
+    done = 0
+    t0 = time.time()
+
+    def load_one(code: str) -> tuple:
+        try:
+            data = _load_kline_raw(code, days)
+            return code, data
+        except Exception:
+            return code, []
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = {ex.submit(load_one, c): c for c in codes}
+        for future in as_completed(futures):
+            done += 1
+            if progress and (done % 500 == 0 or done == total):
+                elapsed = time.time() - t0
+                rate = done / elapsed if elapsed > 0 else 0
+                eta = (total - done) / rate if rate > 0 else 0
+                print(f"  预加载: {done}/{total} ({done*100//total}%)  "
+                      f"已用时{elapsed:.0f}s  剩余约{eta:.0f}s", flush=True)
+            code, data = future.result()
+            result_map[code] = data
+
+    elapsed = time.time() - t0
+    if progress:
+        print(f"  预加载完成: {total} 只，耗时 {elapsed:.1f}s，"
+              f"数据总量 ~{sum(len(v) for v in result_map.values()):,} 条记录")
+    return result_map
+
+
+def _load_kline_raw(code: str, days: int) -> list:
+    """内部：直接读.day文件，返回原始记录列表（不经过 read_tdx_kline）"""
+    market, pure = _normalize_code(code)
+    file_path = TDX_DATA_DIR / market / "lday" / f"{market}{pure}.day"
+    with open(file_path, 'rb') as f:
+        data = f.read()
+
+    records = []
+    for i in range(0, len(data), RECORD_SIZE):
+        chunk = data[i:i + RECORD_SIZE]
+        if len(chunk) < RECORD_SIZE:
+            break
+        r = _parse_record(chunk)
+        records.append(r)
+    # .day 文件按日期升序（旧→新），取最后 days 条（最新）
+    return records[-days:] if len(records) > days else records
+
+
+# ============================================================
+#  核心分析逻辑（纯函数，接收 dict/list 数据）
+# ============================================================
+
+def analyze_from_cache(
+    code: str,
+    data_map: Dict[str, list],
+    trend_days: int = 20,
+    vol_lookback: int = 5,
+    vol_ratio_threshold: float = 1.5,
+    require_ma60_rising: bool = False,
+    breakout_lookback: int = 20,
+    require_breakout: bool = False,
+    turnover_min: float = 0.0,
+) -> dict:
+    """
+    从预加载的 dict 中分析趋势放量。
+
+    完全在内存中运行，零磁盘 IO。
+
+    Parameters
+    ----------
+    code : str
+        股票代码
+    data_map : dict
+        preload_all_klines() 返回的内存数据
+    trend_days : int
+        趋势判断天数（默认20）
+    vol_lookback : int
+        量能窗口（默认5）
+    vol_ratio_threshold : float
+        放量阈值（默认1.5）
+    require_ma60_rising : bool
+        是否要求MA60上升（严格模式）
+    breakout_lookback : int
+        平台突破参考期，默认20天（不算今天）
+    require_breakout : bool
+        是否要求突破平台（今日收盘 > 过去N天最高价），默认False
+    turnover_min : float
+        换手率最低要求（%），默认0.0表示不限制
+    """
+    import pandas as pd
+
+    raw = data_map.get(code) or data_map.get(code.strip()) or []
+    if not raw:
+        return {"code": code, "is_trend_volume": False, "error": "数据不存在"}
+
+    lookback = max(trend_days, 60, breakout_lookback + 1)
+    if len(raw) < lookback:
+        return {"code": code, "is_trend_volume": False, "error": f"数据不足{lookback}天"}
+
+    df = pd.DataFrame(raw).sort_values('date').reset_index(drop=True)
+    recent = df.iloc[-lookback:].copy().reset_index(drop=True)
+
+    # ---- 均线 ----
+    recent['ma5']  = recent['close'].rolling(5).mean()
+    recent['ma10'] = recent['close'].rolling(10).mean()
+    recent['ma20'] = recent['close'].rolling(20).mean()
+    recent['ma60'] = recent['close'].rolling(60).mean()
+
+    # ---- 量能 ----
+    recent['vol_ma5'] = recent['volume'].rolling(5).mean()
+    recent['volume_ratio'] = recent['volume'] / recent['vol_ma5']
+
+    # ---- 涨跌 ----
+    recent['change_pct'] = recent['close'].pct_change() * 100
+
+    latest = recent.iloc[-1]
+    last_n = recent.iloc[-trend_days:]
+
+    # ---- 趋势信号 ----
+    up_days = int((last_n['change_pct'] > 0).sum())
+    trend_strength = up_days / trend_days
+
+    ma5_above_ma10 = latest['ma5'] > latest['ma10']
+    ma10_above_ma20 = latest['ma10'] > latest['ma20']
+    ma5_above_ma20 = latest['ma5'] > latest['ma20']
+    ma_bullish = ma5_above_ma10 and ma10_above_ma20
+    price_above_ma20 = latest['close'] > latest['ma20']
+
+    # MA60 斜率
+    ma60_rising = False
+    if require_ma60_rising and len(recent) >= 66:
+        ma60_vals = recent['ma60'].iloc[-5:].values
+        if not any(pd.isna(v) for v in ma60_vals):
+            slope = (ma60_vals[-1] - ma60_vals[0]) / 4
+            ma60_rising = slope > 0
+
+    is_uptrend = trend_strength >= 0.6 and (ma_bullish or price_above_ma20)
+    if require_ma60_rising:
+        is_uptrend = is_uptrend and ma60_rising
+
+    # ---- 放量信号 ----
+    current_vol_ratio = float(latest['volume_ratio']) if not pd.isna(latest['volume_ratio']) else 0.0
+    avg_vol_ratio = float(recent['volume_ratio'].iloc[-vol_lookback:].mean())
+    vol_trend_up = recent['volume_ratio'].iloc[-1] > recent['volume_ratio'].iloc[-vol_lookback]
+    is_volume_increasing = (
+        avg_vol_ratio >= vol_ratio_threshold
+        or (vol_trend_up and current_vol_ratio >= 1.2)
+    )
+
+    # ---- 平台突破信号 ----
+    # 过去 breakout_lookback 天（不含今天）的最高价
+    recent_no_today = recent.iloc[-breakout_lookback - 1:-1]
+    recent_high = recent_no_today['high'].max()
+    is_breakout = float(latest['close']) > float(recent_high)
+
+    # ---- 换手率 ----
+    # 估算换手率 = 成交额/市值 = volume*100*close / (close*总股本) = volume*100/总股本
+    # 通达信 .day 没有总股本数据，用"假设流通股本=成交量×收盘价/昨日收盘"做近似
+    # 更实用做法：用成交额/昨日收盘市值近似，换手率(%) = 成交额/(收盘价×总股本) × 100
+    # 由于无总股本数据，采用近似：换手率 ≈ 成交量(手) / 假设流通盘(万股) × 100
+    # 默认流盘≈3000万股为典型值，计算后除以100得到百分比
+    # 更准的近似：成交额/收盘价/1亿 = 成交量(手)×收盘价/收盘价/1亿 = 成交量(手)/100万
+    # 换手率(%) ≈ 成交量(手) / 100000，即1万手≈10%
+    # 这个换算对不同价格股票有差异，提供原始值供判断
+    turnover_rate = None
+    if latest['close'] > 0 and latest['volume'] > 0:
+        # 近似换手率：成交额/（收盘价×假设总股本1亿股）×100%
+        # = (成交量×收盘价) / (收盘价 × 1亿) × 100%
+        # = 成交量(手) / 1万手 ≈ 成交量/10000
+        # 但实际流通盘差异很大，这里给出的是"参考换手率（假设全流通）"
+        total_shares_estimate = 1_0000_0000  # 假设1亿股
+        turnover_rate = float(latest['volume'] * 100) / total_shares_estimate * 100  # %
+        turnover_rate = round(turnover_rate, 2)
+
+    # ---- 综合 ----
+    interval_change = float(
+        (latest['close'] - recent.iloc[-trend_days]['close'])
+        / recent.iloc[-trend_days]['close'] * 100
+    )
+
+    if len(recent) >= 2:
+        last_day = recent.iloc[-1]
+        prev_day = recent.iloc[-2]
+        day_change = float((last_day['close'] - prev_day['close']) / prev_day['close'] * 100)
+    else:
+        day_change = 0.0
+
+    is_trend_volume = bool(is_uptrend and is_volume_increasing)
+
+    return {
+        "code": code,
+        "is_trend_volume": is_trend_volume,
+        "is_uptrend": is_uptrend,
+        "is_volume_increasing": is_volume_increasing,
+        "volume_ratio": round(current_vol_ratio, 2),
+        "avg_volume_ratio": round(avg_vol_ratio, 2),
+        "trend_strength": round(float(trend_strength), 2),
+        "change_pct": round(interval_change, 2),
+        "day_change_pct": round(day_change, 2),
+        "ma5_above_ma20": bool(ma5_above_ma20),
+        "price_above_ma20": bool(price_above_ma20),
+        "ma60_rising": bool(ma60_rising),
+        "is_breakout": is_breakout,
+        "recent_high": round(float(recent_high), 2),
+        "turnover_rate": turnover_rate,
+        "days": len(recent),
+    }
+
+
+# ============================================================
+#  单码接口（自己读文件，供独立使用）
+# ============================================================
+
+def is_trend_volume(
+    code: str,
+    trend_days: int = 20,
+    vol_lookback: int = 5,
+    vol_ratio_threshold: float = 1.5,
+    require_ma60_rising: bool = False,
+    breakout_lookback: int = 20,
+    require_breakout: bool = False,
+    turnover_min: float = 0.0,
+) -> dict:
+    """判断单只股票是否处于"上升趋势 + 阶段放量"形态"""
+    from stock_common.tdx_day_reader import read_tdx_kline
+
+    try:
+        data = read_tdx_kline(code, days=trend_days + 60)
+    except FileNotFoundError:
+        return {"code": code, "is_trend_volume": False, "error": "数据文件不存在"}
+
+    if not data or len(data) < trend_days:
+        return {"code": code, "is_trend_volume": False, "error": "数据不足"}
+
+    import pandas as pd
+    df = pd.DataFrame(data)
+    df['date'] = pd.to_datetime(df['date'])
+    df = df.sort_values('date').reset_index(drop=True)
+
+    return analyze_from_cache(
+        code, {code: df.to_dict('records')},
+        trend_days=trend_days,
+        vol_lookback=vol_lookback,
+        vol_ratio_threshold=vol_ratio_threshold,
+        require_ma60_rising=require_ma60_rising,
+        breakout_lookback=breakout_lookback,
+        require_breakout=require_breakout,
+        turnover_min=turnover_min,
+    )
+
+
+# ============================================================
+#  批量接口（30线程并发读文件，供 is_trend_volume 替代）
+# ============================================================
+
+def is_trend_volume_batch(
+    codes: list,
+    trend_days: int = 20,
+    vol_lookback: int = 5,
+    vol_ratio_threshold: float = 1.5,
+    require_ma60_rising: bool = False,
+    breakout_lookback: int = 20,
+    require_breakout: bool = False,
+    turnover_min: float = 0.0,
+    workers: int = 30,
+    progress: bool = True,
+) -> list:
+    """批量分析（并发读文件）"""
+    codes = [c.strip() for c in codes if c.strip()]
+    total = len(codes)
+    results = [None] * total
+    done = 0
+    t0 = time.time()
+
+    def fetch_and_analyze(idx_code):
+        idx, code = idx_code
+        import pandas as pd
+        from stock_common.tdx_day_reader import read_tdx_kline
+        try:
+            data = read_tdx_kline(code, days=trend_days + 60)
+        except FileNotFoundError:
+            return idx, {"code": code, "is_trend_volume": False, "error": "文件不存在"}
+        if not data or len(data) < trend_days:
+            return idx, {"code": code, "is_trend_volume": False, "error": "数据不足"}
+        df = pd.DataFrame(data)
+        df['date'] = pd.to_datetime(df['date'])
+        df = df.sort_values('date').reset_index(drop=True)
+        res = analyze_from_cache(
+            code, {code: df.to_dict('records')},
+            trend_days=trend_days,
+            vol_lookback=vol_lookback,
+            vol_ratio_threshold=vol_ratio_threshold,
+            require_ma60_rising=require_ma60_rising,
+            breakout_lookback=breakout_lookback,
+            require_breakout=require_breakout,
+            turnover_min=turnover_min,
+        )
+        return idx, res
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = {ex.submit(fetch_and_analyze, (i, c)): (i, c) for i, c in enumerate(codes)}
+        for future in as_completed(futures):
+            done += 1
+            if progress and (done % 200 == 0 or done == total):
+                elapsed = time.time() - t0
+                rate = done / elapsed if elapsed > 0 else 0
+                eta = (total - done) / rate if rate > 0 else 0
+                print(f"  趋势放量: {done}/{total} ({done*100//total}%)  "
+                      f"已用时{elapsed:.0f}s  剩余约{eta:.0f}s", flush=True)
+            idx, res = future.result()
+            results[idx] = res
+
+    return results
+
+
+# ============================================================
+#  便捷打印
+# ============================================================
+
+def print_trend_volume(code: str, **kwargs):
+    """打印单码趋势量能分析结果"""
+    result = is_trend_volume(code, **kwargs)
+    c = result['code']
+
+    if "error" in result:
+        print(f"❌ {c}: {result['error']}")
+        return result
+
+    signal = "✅ 上升趋势+放量" if result['is_trend_volume'] else "❌ 非上升趋势放量"
+    trend_txt = "强势" if result['is_uptrend'] else "弱势"
+    vol_txt = "放量" if result['is_volume_increasing'] else "缩量"
+
+    print(f"\n{'='*60}")
+    print(f"  {c}  趋势量能分析")
+    print(f"{'='*60}")
+    print(f"  信号:   {signal}")
+    print(f"  趋势:   {trend_txt} (强度 {result['trend_strength']:.0%})")
+    print(f"  量能:   {vol_txt} (量比 {result['volume_ratio']:.2f}, 均量比 {result['avg_volume_ratio']:.2f})")
+    print(f"  区间涨跌: {result['change_pct']:+.2f}%")
+    print(f"  MA5>MA20: {'是' if result['ma5_above_ma20'] else '否'}  |  "
+          f"价格>MA20: {'是' if result['price_above_ma20'] else '否'}  |  "
+          f"MA60上升: {'是' if result['ma60_rising'] else '否'}")
+    print(f"{'='*60}")
+    return result
+
+
+# ============================================================
+#  CLI
+# ============================================================
+
+if __name__ == "__main__":
+    import sys
+    code = sys.argv[1] if len(sys.argv) > 1 else "sh600036"
+    print_trend_volume(code)
