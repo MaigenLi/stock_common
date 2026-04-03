@@ -26,13 +26,19 @@ K线形态趋势量能分析通用接口
 import sys
 import time
 import struct
+import datetime
 from pathlib import Path
 from typing import Optional, Dict, List
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import numpy as np
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from stock_common.tdx_day_reader import TDX_DATA_DIR, RECORD_SIZE, _normalize_code, _find_file, _parse_record
+from stock_common.tdx_day_reader import (
+    TDX_DATA_DIR, RECORD_SIZE, _normalize_code, _find_file, _parse_record,
+    _load_cache_index, _ensure_cache_valid, _market_cache,
+)
 
 # ============================================================
 #  预加载：一次性读取全部股票数据到内存
@@ -72,6 +78,14 @@ def preload_all_klines(
     done = 0
     t0 = time.time()
 
+    # 先确保各市场缓存就绪（惰性构建/验证）
+    markets_seen = set()
+    for c in codes:
+        m, _ = _normalize_code(c)
+        markets_seen.add(m)
+    for m in markets_seen:
+        _ensure_cache_valid(m)
+
     def load_one(code: str) -> tuple:
         try:
             data = _load_kline_raw(code, days)
@@ -100,12 +114,30 @@ def preload_all_klines(
 
 
 def _load_kline_raw(code: str, days: int) -> list:
-    """内部：直接读.day文件，返回原始记录列表（不经过 read_tdx_kline）"""
+    """内部：优先从 numpy 缓存读取，缓存失效则直接读 .day 文件"""
     market, pure = _normalize_code(code)
+    # 尝试从 numpy 缓存读取
+    index = _load_cache_index(market)
+    if (market in _market_cache and
+            index is not None and pure in index.get("stocks", {})):
+        info = index["stocks"][pure]
+        offset, count = info["offset"], info["count"]
+        mm = _market_cache[market]["mm"]
+        slice_data = mm[offset:offset + count].astype(np.float64)
+        records = []
+        for i in range(count):
+            r = slice_data[i]
+            records.append({
+                'date': datetime.datetime.fromtimestamp(r[0]),
+                'open': r[1], 'high': r[2], 'low': r[3], 'close': r[4],
+                'amount': r[5], 'volume': r[6],
+            })
+        return records[-days:] if len(records) > days else records
+
+    # 兜底：直接读 .day 文件
     file_path = TDX_DATA_DIR / market / "lday" / f"{market}{pure}.day"
     with open(file_path, 'rb') as f:
         data = f.read()
-
     records = []
     for i in range(0, len(data), RECORD_SIZE):
         chunk = data[i:i + RECORD_SIZE]
@@ -113,7 +145,6 @@ def _load_kline_raw(code: str, days: int) -> list:
             break
         r = _parse_record(chunk)
         records.append(r)
-    # .day 文件按日期升序（旧→新），取最后 days 条（最新）
     return records[-days:] if len(records) > days else records
 
 
