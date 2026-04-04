@@ -12,6 +12,10 @@
 - 历史部分始终以通达信本地离线数据为准
 - 交易日 15:00 前，如果本地目录还没有今天这一根 K 线，就尝试用腾讯行情补当天数据
 - 返回结果会附带元信息，明确是否用了实时补丁、是否判定为完整数据
+
+改进：
+- 底层优先使用 tdx_day_reader 的 numpy 缓存加速
+- 统一 normalize 逻辑
 """
 
 from __future__ import annotations
@@ -32,6 +36,19 @@ DEFAULT_TDX_DIR_CANDIDATES = (
     os.path.expanduser("~/stock_data/vipdoc/"),
     "/mnt/d/new_tdx/vipdoc/",
 )
+
+# 延迟导入 tdx_day_reader 以避免循环依赖
+_tdx_reader = None
+
+def _get_tdx_reader():
+    global _tdx_reader
+    if _tdx_reader is None:
+        try:
+            from . import tdx_day_reader
+            _tdx_reader = tdx_day_reader
+        except ImportError:
+            _tdx_reader = None
+    return _tdx_reader
 
 
 @dataclass
@@ -118,11 +135,47 @@ def read_local_tdx_daily(
 ) -> Optional[pd.DataFrame]:
     """读取本地通达信日线。
 
+    优先使用 tdx_day_reader 的 numpy 缓存加速。
+    如果缓存不可用，则直接解析 .day 二进制文件。
+
     字段约定：
     - price: 元
     - amount: 元（按 IEEE754 单精度浮点数解析）
     - volume: 保持与通达信原始字段一致（手 × 100），便于和既有项目兼容
     """
+    # 优先使用缓存
+    reader = _get_tdx_reader()
+    if reader is not None:
+        try:
+            normalized = normalize_stock_code(code)
+            records = reader.read_tdx_kline(normalized)
+            if records:
+                rows = []
+                for r in records:
+                    date_str = r.get('date', '')
+                    if isinstance(date_str, str):
+                        date_int = int(date_str.replace('-', ''))
+                    else:
+                        date_int = 0
+                    rows.append({
+                        'date_int': date_int,
+                        'date': pd.to_datetime(date_str) if date_str else None,
+                        'open': r.get('open', 0),
+                        'high': r.get('high', 0),
+                        'low': r.get('low', 0),
+                        'close': r.get('close', 0),
+                        'amount': r.get('amount', 0),
+                        'volume': r.get('volume', 0),
+                    })
+                df = pd.DataFrame(rows)
+                df = df[df['close'] > 0].sort_values('date').reset_index(drop=True)
+                if not keep_zero_volume:
+                    df = df[df['volume'] > 0].reset_index(drop=True)
+                return df if not df.empty else None
+        except Exception:
+            pass  # 回退到直接解析
+
+    # 兜底：直接解析二进制
     path = get_tdx_day_path(code, data_dir=data_dir)
     if not os.path.exists(path):
         return None

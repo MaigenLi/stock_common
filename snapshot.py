@@ -80,29 +80,121 @@ def get_local_stock_name(code: str) -> str:
     return stock_names.get(normalized) or stock_names.get(code_num) or '未知'
 
 
-@lru_cache(maxsize=1)
-def _load_sector_module():
-    if not os.path.exists(STAGE_TREND_SECTOR_FILE):
+class _SimpleSectorFetcher:
+    """轻量级板块信息获取器（无需外部依赖）。"""
+
+    def __init__(self):
+        self._cache: Dict[str, Dict] = {}
+        self._names_cache: Dict[str, str] = {}
+
+    def get_stock_sector_info(self, code: str, name: str = '', allow_online: bool = True) -> Dict:
+        """获取股票板块信息。"""
+        if code in self._cache:
+            result = self._cache[code].copy()
+            result['name'] = name or result.get('name', '未知')
+            return result
+
+        result = {
+            'code': code,
+            'name': name or '未知',
+            'sectors': [],
+            'main_sector': '未知',
+            'sector_hotness': 40,
+            'sector_popularity': 30,
+            'sector_category': '其他',
+            'source': 'simple_fetcher_default',
+        }
+
+        if allow_online:
+            online_result = self._fetch_online_sector(code)
+            if online_result:
+                result.update(online_result)
+                result['source'] = 'simple_fetcher_online'
+
+        self._cache[code] = result.copy()
+        result['name'] = name or result.get('name', '未知')
+        return result
+
+    def _fetch_online_sector(self, code: str) -> Optional[Dict]:
+        """联网获取板块信息。"""
+        import requests
+        try:
+            resp = requests.get(
+                f"http://qt.gtimg.cn/q={code}",
+                headers={"User-Agent": "Mozilla/5.0", "Referer": "http://finance.qq.com/"},
+                timeout=2.0
+            )
+            if resp.status_code == 200:
+                text = resp.text.strip()
+                if '="' in text:
+                    payload = text.split('="', 1)[1].rstrip('";')
+                    fields = payload.split('~')
+                    if len(fields) > 50:
+                        # 腾讯行情字段 50+ 通常是板块信息
+                        sector_str = fields[50] if len(fields) > 50 else ''
+                        if sector_str:
+                            sectors = [s.strip() for s in sector_str.split(',') if s.strip()]
+                            if sectors:
+                                return {
+                                    'sectors': sectors,
+                                    'main_sector': sectors[0] if sectors else '未知',
+                                    'sector_category': self._categorize_sector(sectors[0] if sectors else ''),
+                                }
+        except Exception:
+            pass
         return None
 
-    spec = importlib.util.spec_from_file_location('stock_common_stage_sector', STAGE_TREND_SECTOR_FILE)
-    if spec is None or spec.loader is None:
-        return None
-
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    def _categorize_sector(self, sector: str) -> str:
+        """简单板块分类。"""
+        sector_lower = sector.lower()
+        if any(k in sector_lower for k in ['科技', '软件', '互联', '电子', '通信', '计算机']):
+            return '科技'
+        if any(k in sector_lower for k in ['新能源', '光伏', '锂电', '储能', '电力']):
+            return '新能源'
+        if any(k in sector_lower for k in ['医药', '医疗', '生物', '健康']):
+            return '医药'
+        if any(k in sector_lower for k in ['银行', '保险', '证券', '金融']):
+            return '金融'
+        if any(k in sector_lower for k in ['汽车', '整车', '零部件']):
+            return '汽车'
+        if any(k in sector_lower for k in ['地产', '房地产', '建筑', '建材']):
+            return '地产'
+        if any(k in sector_lower for k in ['消费', '食品', '饮料', '家电', '纺织', '服装']):
+            return '消费'
+        if any(k in sector_lower for k in ['军工', '航天', '航空', '国防']):
+            return '军工'
+        if any(k in sector_lower for k in ['化工', '石油', '煤炭', '钢铁', '有色']):
+            return '周期'
+        if any(k in sector_lower for k in ['农业', '种业', '养殖', '渔业', '林业']):
+            return '农业'
+        if any(k in sector_lower for k in ['零售', '批发', '电商', '物流', '航运']):
+            return '商贸'
+        if any(k in sector_lower for k in ['传媒', '文化', '教育', '旅游', '酒店']):
+            return '文教'
+        return '其他'
 
 
 @lru_cache(maxsize=1)
 def _get_sector_fetcher():
-    module = _load_sector_module()
-    if module is None or not hasattr(module, 'get_sector_info'):
-        return None
-    try:
-        return module.get_sector_info()
-    except Exception:
-        return None
+    """获取板块信息获取器。优先使用外部模块，失败则用轻量级内置。"""
+    module = None
+    if os.path.exists(STAGE_TREND_SECTOR_FILE):
+        try:
+            spec = importlib.util.spec_from_file_location('stock_common_stage_sector', STAGE_TREND_SECTOR_FILE)
+            if spec is not None and spec.loader is not None:
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+        except Exception:
+            module = None
+
+    if module is not None and hasattr(module, 'get_sector_info'):
+        try:
+            return module.get_sector_info()
+        except Exception:
+            pass
+
+    # Fallback: 使用轻量级内置获取器
+    return _SimpleSectorFetcher()
 
 
 def get_stock_sector_info(code: str, allow_online: bool = True) -> Dict:
@@ -134,6 +226,7 @@ def get_stock_sector_info(code: str, allow_online: bool = True) -> Dict:
 
 
 def get_sector_snapshot(code: str, name: str = '', allow_online: bool = True) -> Dict:
+    """获取股票板块快照。"""
     normalized = normalize_stock_code(code)
     fetcher = _get_sector_fetcher()
     if fetcher is None:
@@ -150,11 +243,6 @@ def get_sector_snapshot(code: str, name: str = '', allow_online: bool = True) ->
 
     try:
         return fetcher.get_stock_sector_info(normalized, name=name, allow_online=allow_online)
-    except TypeError:
-        try:
-            return fetcher.get_stock_sector_info(normalized, name=name)
-        except Exception:
-            pass
     except Exception:
         pass
 

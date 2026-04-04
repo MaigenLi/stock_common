@@ -197,6 +197,13 @@ python show_kline.py --rank --date 2026-04-02 --gain 3.0 --top 20 --trend-volume
 python show_kline.py --rank --date 2026-04-02 --gain 5.0 --top 30 --turnover 3.0
 ```
 
+### 涨幅 + 趋势放量 + 换手率过滤
+
+```bash
+# 涨幅≥1% 且 换手率≥3%
+python show_kline.py --rank --date 2026-04-03 --gain 1.0 --top 300 --trend-volume --turnover 3.0
+```
+
 ---
 
 ## 完整参数参考
