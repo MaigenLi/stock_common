@@ -312,7 +312,7 @@ def main():
     parser = argparse.ArgumentParser(description='显示股票K线数据')
 
     # 模式互斥组
-    mode_group = parser.add_mutually_exclusive_group(required=True)
+    mode_group = parser.add_mutually_exclusive_group(required=False)
     mode_group.add_argument('--code', '-c', type=str, help='单个股票代码')
     mode_group.add_argument('--file', '-f', type=str, nargs='?',
                             const=DEFAULT_CODE_FILE, default=None,
@@ -343,8 +343,23 @@ def main():
                         help='要求突破平台（今日收盘 > 过去20天最高价）')
     parser.add_argument('--turnover', type=float, default=0.0,
                         help='换手率阈值%%（默认不限制）')
+    parser.add_argument('--rebuild-cache', action='store_true',
+                        help='重建 numpy 缓存后退出（独立选项，不受互斥组约束）')
 
     args = parser.parse_args()
+
+    if args.rebuild_cache:
+        if _IN_STOCK_COMMON_DIR:
+            from tdx_day_reader import rebuild_all_caches
+        else:
+            from stock_common.tdx_day_reader import rebuild_all_caches
+        rebuild_all_caches()
+        return
+
+    # 必须指定一种模式
+    if not args.code and not args.file and not args.rank:
+        print("❌ 必须指定 --code / --file / --rank 之一")
+        sys.exit(1)
 
     if args.rank:
         # 涨幅排序模式

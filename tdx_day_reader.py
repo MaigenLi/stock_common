@@ -420,6 +420,13 @@ def print_kline(code: str, days: int = 10, end_date: str = "today") -> list[dict
         print(f"未找到数据: {code}")
         return []
 
+    # 精确日期校验：指定日期 + days=1 时，要求最末条必须恰好是请求那天
+    if end_date not in (None, "today") and days == 1:
+        actual_date = data[-1]['date']
+        if actual_date != end_date:
+            print(f"\n❌ {code}: {end_date} 非交易日或无数据（最近可用: {actual_date}）")
+            return []
+
     print(f"\n{'='*80}")
     print(f"股票代码: {code}  |  最近 {len(data)} 天  |  截止: {data[-1]['date']}")
     print(f"{'='*80}")
