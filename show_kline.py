@@ -42,7 +42,7 @@ else:
     from stock_common.tdx_day_reader import print_kline, read_tdx_kline
     from stock_common.trend_volume import preload_all_klines, analyze_from_cache
 
-DEFAULT_CODE_FILE = '/home/hfie/stock_code/results/stock_codes.txt'
+DEFAULT_CODE_FILE = '~/stock_code/results/stock_codes.txt'
 
 
 def load_codes_from_file(file_path: str) -> list[str]:
